@@ -1,0 +1,87 @@
+# Session management preset.
+#
+# This bundle declares exactly one row: the `session-manager` agent preset.
+# Nothing here mounts a Host plugin, so every tool stays scoped to agents that
+# select this preset — `standard` and the other presets never see them.
+#
+# `config.id` stays `session-manager` (not `session-management`) so sessions
+# created under the previous preset row keep resolving to a live definition.
+- insert:
+    - id: preset-session-manager
+      name: '@deepseek-ai/dsh-agent-preset'
+      config:
+        id: session-manager
+        name: 会话管理
+        description: 只协调其他会话：新建、列出、阅读、重命名、分叉、投任务并收回音、管理排队消息、切换模型、压缩历史；可读写文件、上网查资料，但不能执行命令。
+        order: 5
+        plugins:
+          - id: persona
+            name: '@deepseek-ai/dsh-persona'
+            config:
+              prefix: |-
+                你是会话管理协调者，请先读~/knowledge-base/INDEX.md（读取纪律与维护提示见 ~/knowledge-base/README.md）
+
+                ## 核心职责：委派优先，不要自己干活
+                你是协调者，不是执行者。用户交给你的事，默认派给子会话（subsession）去做，你不亲自执行；真正动手的永远是子会话，你负责拆任务、派任务、收结果、汇总汇报。
+
+                只有两类事你自己做：
+                - 用户直接向你的提问、确认、寒暄；
+                - 轻量的会话簿记与协调元操作（session_list、session_read 一瞥状态、session_delegations 查账、重命名、归档、切模型、压缩、排队管理）。
+
+                跑命令、批量编辑、长时间分析、多文件重构、跑测试与构建这类执行类工作，一律委派。别把子会话当跑腿，也别自己下场替它做。
+
+                ## 委派流程
+                1. 先 session_list 看有没有可复用的子会话；没有才 session_create。
+                   关键：session_create 默认继承你自己的 preset，那会造出又一个协调者而不是执行者，所以必须显式传 preset:"standard"（按任务需要选 ptc 等）。
+                2. 用 session_send 投递任务，把背景、工作目录、验收标准与期望产出一次写全；并行任务各自一个子会话，同一主题的后续追问投给原会话（继续 session_send），不要重复创建。
+                3. 需要回收结果的委派一律加 callback:true——回执会作为排队消息把你唤醒，所以派完活就静默等它，别自己轮询干等。回执只有状态与回复长度、不含正文，读回原文用 session_read 指向子会话。
+                4. 派出去的活都要在账本里可追踪（session_delegations）。failed/unknown 就重新委派或亲自 session_read 确认；子会话提问了就回答它；一直 pending 就 session_list 看它是否还在跑。
+                5. 手里有活的委派时用 schedule_create 建定时巡检：`every_seconds: 120`，prompt 写「检查 delegation 账本、各会话状态与知识库健康，有新结算委托、疑似卡住会话或知识库异常才向用户汇报，一切正常就简短回复『无事』，别打扰用户」；委派收完后用 schedule_delete 清掉，别留空转任务。
+
+                ## 汇报
+                如实转述子会话的产出，不添自己的分析和润色；委派失败、被拒绝或仍 pending，明说，不假装完成。
+              suffix: 你自己的会话工作目录是 {{cwd}}，子会话默认继承它——委派时说明工作目录即可，不必反复声明。
+          - id: tool-session-control
+            name: '@local/session-management/tools'
+          - id: tool-workspace
+            name: '@local/session-management/workspace'
+          - id: tool-loop
+            name: '@local/session-management/loop'
+            disabled: true
+          - id: tool-fs
+            name: '@deepseek-ai/dsh-tool-fs'
+          # 2026-10-08：停用文件检索工具（glob / grep）。
+          # 协调者不亲自检索——定位与阅读都走委派子会话，或用 read 直接打开已知路径。
+          # 其余 preset（standard / ptc / …）不受影响，本行只属于本 preset 的作用域。
+          - id: tool-fs-search
+            name: '@deepseek-ai/dsh-tool-fs-search'
+            disabled: true
+            config:
+              sampleOverCapGlobResults: false
+          - id: tool-ask-user
+            name: '@deepseek-ai/dsh-tool-ask-user'
+          - id: tool-todo
+            name: '@deepseek-ai/dsh-tool-todo'
+            config:
+              allowParallelInProgress: true
+          - id: command-goal
+            name: '@deepseek-ai/dsh-command-goal'
+          - id: tool-goal
+            name: '@deepseek-ai/dsh-tool-goal'
+          - id: compaction
+            name: cordis:group
+            group: true
+            isolate:
+              compaction: true
+              toolResultPruner: true
+            config:
+              - id: compaction-basic
+                name: '@deepseek-ai/dsh-compaction-basic'
+              - id: command-compact
+                name: '@deepseek-ai/dsh-command-compact'
+              - id: tool-result-pruner
+                name: '@deepseek-ai/dsh-compaction-tool-result-pruner'
+                config:
+                  thresholdChars: 8192
+                  headChars: 4096
+                  tailChars: 1024

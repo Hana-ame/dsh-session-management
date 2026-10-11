@@ -1,0 +1,20 @@
+{
+  "name": "@local/session-management",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Session management for one agent preset: coordinate other sessions (create/list/read/fork/assign/queue/model/compact) and control their GUI placement (archive/unarchive/pin/unpin). Every tool is registered inside the preset's own scope, so no other preset sees them.",
+  "exports": {
+    "./tools": "./lib/tools.mjs",
+    "./workspace": "./lib/workspace.mjs",
+    "./loop": "./lib/loop.mjs",
+    "./store": "./lib/store.mjs",
+    "./ask-bridge": "./lib/ask-bridge.mjs",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}

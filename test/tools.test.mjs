@@ -1,0 +1,513 @@
+// Smoke test for ../lib/tools.mjs — the tool layer of the package.
+//
+// Runs the real plugin file against a fake Cordis context and a throwaway
+// DSH_HOME, so it exercises the durable store, the transcript extractors, the
+// queue reader and the model-route reader without touching a live DSH process
+// or the real ~/.dsh:
+//
+//   node package/test/tools.test.mjs
+//
+// Exits non-zero when any check fails, so it works as a CI check.
+
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+
+const dshHome = await mkdtemp(join(tmpdir(), 'dsh-session-control-test-'))
+process.env.DSH_HOME = dshHome
+
+const { default: register } = await import(new URL('../lib/tools.mjs', import.meta.url))
+const statePath = join(dshHome, 'session-manager', 'state.json')
+/** Read the persisted store, tolerating the file not existing yet. */
+const persisted = async () => JSON.parse(await readFile(statePath, 'utf8'))
+
+// ── fake Cordis context ────────────────────────────────────────────────────
+
+const captured = {}
+const calls = []
+/** Every signal a tool handed to the live control stream, so cancellation is observable. */
+const controlSignals = []
+/**
+ * Per-session event logs the fake `inspect` answers from. A target that is not
+ * listed here falls back to the shared `events` array; a test appends to a log
+ * to simulate that session doing work after a prompt was delivered.
+ */
+const logs = {}
+/** The callbacks the plugin registered on the timer service, so ticks are manual. */
+const ticks = []
+/** How many sessions the fake `create` has handed out. */
+let created = 0
+
+const events = [
+  { type: 'user/message', seq: 1, time: 1000, data: { id: 'm1', role: 'user', content: [{ type: 'text', text: 'hello there' }], source: { kind: 'user' } } },
+  { type: 'assistant/message', seq: 2, time: 2000, data: { turn: 1, step: 1, message: { id: 'm2', role: 'assistant', content: [{ type: 'text', text: 'hi back' }, { type: 'reasoning', text: 'secret thoughts' }], source: { kind: 'model', provider: 'p', model: 'm' } } } },
+  { type: 'tool/call', seq: 3, time: 3000, data: { turn: 1, step: 1, callId: 'c1', name: 'bash', arguments: '{"command":"ls"}' } },
+  { type: 'tool/result', seq: 4, time: 4000, data: { turn: 1, step: 1, message: { id: 'm3', role: 'user', content: [{ type: 'tool-result', toolCallId: 'c1', content: [{ type: 'text', text: 'file-a\nfile-b' }] }], source: { kind: 'tool', callId: 'c1' } } } },
+  { type: 'tool/result', seq: 5, time: 5000, data: { turn: 1, step: 1, message: { id: 'm4', role: 'user', content: [{ type: 'tool-result', toolCallId: 'c2', content: [{ type: 'text', text: 'boom' }], isError: true }], source: { kind: 'tool', callId: 'c2' } }, error: { name: 'ToolError', code: 'EXPLODED' } } },
+  { type: 'system/message', seq: 6, time: 6000, data: { turn: 1, step: 1, message: { id: 'm5', role: 'system', content: [{ type: 'text', text: 'injected context' }], source: { kind: 'plugin', plugin: 'x' } } } },
+  { type: 'session/title', seq: 7, time: 7000, data: { title: 'My title', messageSeqs: [], source: { kind: 'user' } } },
+  { type: 'request/header', seq: 8, time: 8000, data: { header: { config: { provider: 'p9', model: 'm9', reasoningEffort: 'high' } }, reason: 'initial' } },
+  { type: 'model/selection', seq: 9, time: 9000, data: { provider: 'p8', model: 'm8' } },
+]
+
+const controller = {  list: async () => ({ items: [
+    { sessionId: 'session-a', updatedAt: 1700000000000, running: true, blank: false, cwd: '/tmp/repo', projections: { values: { title: 'Alpha', modelSelection: { lastUsed: { provider: 'p1', model: 'm1' }, next: { provider: 'p2', model: 'm9', reasoningEffort: 'low' } } } } },
+    { sessionId: 'session-b', updatedAt: 1690000000000, running: false, blank: false, cwd: '/tmp/repo', parentSessionId: 'session-a', projections: { values: { title: 'Alpha · fork' } } },
+    { sessionId: 'session-c', updatedAt: 1680000000000, running: false, blank: false, cwd: '/tmp/repo', parentSessionId: 'session-a', origin: 'subagent' },
+  ] }),
+  inspect: async (sessionId) => ({ meta: { id: sessionId, cwd: '/tmp/repo' }, inheritedEventCount: 0, events: logs[sessionId] ?? events }),
+  prompt: async (request) => { calls.push(['prompt', request.sessionId, request.mode, request.content[0].text]); return { accepted: true } },
+  cancel: async (request) => { calls.push(['cancel', request.sessionId]); return { accepted: true } },
+  control: (signal) => {
+    controlSignals.push(signal)
+    return (async function* () {
+      calls.push(['control'])
+      yield { type: 'baseline', value: { queues: {
+        'session-a': [
+          { id: 'msg-queued-01', placement: 'queued', message: { id: 'msg-queued-01', content: [{ type: 'text', text: 'run the tests after this turn' }] } },
+          { id: 'msg-steering-02', placement: 'steering', message: { id: 'msg-steering-02', content: [{ type: 'text', text: 'stop and report' }] } },
+          { id: 'msg-long-03', placement: 'queued', message: { id: 'msg-long-03', content: [{ type: 'text', text: 'x'.repeat(600) }] } },
+        ],
+        'session-live-empty': [],
+      }, jobs: {}, projections: {} } }
+      // A real control stream stays open until its caller aborts; the tool must
+      // take the baseline and release the stream rather than wait for more frames.
+      await new Promise((resolve) => {
+        if (signal.aborted) resolve()
+        else signal.addEventListener('abort', resolve, { once: true })
+      })
+      calls.push(['control-released'])
+    })()
+  },
+  fork: async (request) => { calls.push(['fork', request.sessionId, String(request.atSeq)]); return { sessionId: 'session-forked' } },
+  create: async (request) => {
+    calls.push(['create', JSON.stringify(request)])
+    if (request.agentPreset === 'nope') {
+      const error = new Error('no agent preset named "nope"')
+      error.code = 'agent-preset/not-found'
+      throw error
+    }
+    created += 1
+    return { sessionId: `session-new-${created}`, agentPreset: request.agentPreset }
+  },
+  rename: async (request) => {
+    calls.push(['rename', request.sessionId, request.title])
+    if (request.title === 'boom') {
+      const error = new Error('title rejected')
+      error.code = 'gateway/internal'
+      throw error
+    }
+    // The REAL host normalizes and truncates before accepting (`dsh-session-title`
+    // `normalizeSessionTitle`), so the returned title is NOT the string that was
+    // sent. Mirror that here: an echo-back fake would let a tool that reports its
+    // own input instead of the host's answer pass every test.
+    const normalized = request.title
+      .replace(/[\u001B\u009B][0-?]*[ -/]*[@-~]/gu, '')
+      .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F]/gu, '')
+      .replace(/\s+/gu, ' ')
+      .trim()
+      .slice(0, 24)
+      .trimEnd()
+    if (normalized.length === 0) {
+      const error = new Error('session title must contain visible characters')
+      error.code = 'session/title-invalid'
+      throw error
+    }
+    return { title: normalized, seq: 99 }
+  },
+  modelCatalog: async () => ({
+    default: { provider: 'p1', model: 'm1' },
+    routableProviders: ['p1', 'p2'],
+    groups: [
+      { id: 'p1', name: 'Provider One', models: [
+        { id: 'm1', name: 'Model One', reasoning: { efforts: [{ id: 'low' }, { id: 'high' }], defaultEffort: 'low' } },
+        { id: 'm2' },
+      ] },
+      { id: 'p2', name: 'Provider Two', models: [] },
+    ],
+    failures: [{ id: 'p3', name: 'Provider Three', message: 'no credential' }],
+  }),
+  selectModel: async (request) => {
+    calls.push(['selectModel', request.sessionId, request.provider, request.model, String(request.reasoningEffort)])
+    return { selected: { provider: request.provider, model: request.model, ...(request.reasoningEffort === undefined ? {} : { reasoningEffort: request.reasoningEffort }) } }
+  },
+}
+
+/** The host command registry: `/compact` is what session_compact drives. */
+const commands = {
+  execute: async (agent, line, attachments, signal) => {
+    calls.push(['command', agent.id, line, String(signal !== undefined && signal !== null), String(attachments.length)])
+    if (agent.id === 'session-busy') return { commandId: 'cmd-busy', result: { kind: 'error', text: 'Compaction is unavailable because this process has an active compaction, or the agent is not idle.' } }
+    if (agent.id === 'session-minimal' || agent.id === 'session-cold') return undefined
+    return { commandId: 'cmd-1', result: { kind: 'success', text: 'Compacted 12 history items (~3400 tokens).' } }
+  },
+}
+/** Everything has a live agent here except `session-cold`, which never attached. */
+const agents = { get: (id) => (id === 'session-cold' ? undefined : { id }) }
+
+/**
+ * The durable workspace registry. `/tmp/repo` is a registered workspace root, so
+ * a session created there is ATTACHED (workspaceId form); any other directory is
+ * not, and keeps its exact cwd.
+ */
+const workspaces = { resolveByPath: async (path) => (path === '/tmp/repo' ? { id: 'ws-1', path: '/tmp/repo' } : undefined) }
+
+/** The timer service, captured so the test decides when the watcher runs. */
+const timer = { interval: (callback) => { ticks.push(callback); return () => {} } }
+
+register.apply({
+  get: (name) => (name === 'sessionController' ? controller : (name === 'commands' ? commands : (name === 'agents' ? agents : (name === 'timer' ? timer : (name === 'workspaceRegistry' ? workspaces : undefined))))),
+  tools: { register: (definition) => { captured[definition.name] = definition } },
+})
+
+// ── assertions ─────────────────────────────────────────────────────────────
+
+const callerExec = { agent: { id: 'me', session: { header: { cwd: '/tmp/repo' } } } }
+const bareExec = { agent: undefined }
+const results = []
+const check = (label, condition, detail) => {
+  results.push([condition ? 'PASS' : 'FAIL', label, condition ? '' : ` => ${String(detail)}`])
+}
+const same = (a, b) => JSON.stringify(a) === JSON.stringify(b)
+
+check('fifteen tools registered', same(Object.keys(captured).sort(), [
+  'session_archive', 'session_compact', 'session_create', 'session_delegations', 'session_describe', 'session_fork', 'session_list', 'session_model', 'session_models', 'session_queue', 'session_queue_manage', 'session_read', 'session_rename', 'session_send', 'session_stop',
+]), Object.keys(captured).join(','))
+
+// Every tool here registers through the RAW `ctx.tools.register()` path rather
+// than `defineTool()`, so `parameters` reaches the model API verbatim — the
+// registry validates only the OUTPUT schema. Providers require an object root,
+// and a declared-but-empty `{}` is not one: it is sent as `type: null` and the
+// whole request fails with
+//   Invalid schema for function '<name>': schema must be a JSON Schema of
+//   'type: "object"', got 'type: null'.
+// A tool with no arguments still has to say so. Assert the root explicitly for
+// every registered tool, so an argument-less tool added later cannot silently
+// reintroduce the failure.
+for (const [name, tool] of Object.entries(captured)) {
+  const schema = tool.parameters
+  check(`${name} declares an object-rooted parameter schema`,
+    schema !== null && typeof schema === 'object' && schema.type === 'object',
+    JSON.stringify(schema))
+}
+check('an argument-less tool declares an empty, not absent, object root',
+  same(captured.session_models.parameters, { type: 'object', properties: {} }),
+  JSON.stringify(captured.session_models.parameters))
+
+// The pre-0.2 note file must survive an in-place upgrade. Seed one before the
+// store has ever been read, then check it is what the tool reports.
+await mkdir(join(dshHome, 'session-manager'), { recursive: true })
+await writeFile(
+  join(dshHome, 'session-manager', 'descriptions.json'),
+  JSON.stringify({ version: 1, byId: { 'session-legacy': { description: 'migrated note', updatedAt: 1 } } }),
+)
+check('legacy notes migrate into the store',
+  (await captured.session_describe.execute({ sessionId: 'session-legacy' })).text.includes('migrated note'))
+
+// session_list
+const list = await captured.session_list.execute({ scope: 'workspace' }, callerExec)
+check('list ok', list.ok === true, list.text)
+check('missing caller cwd is explicit, not silently empty',
+  (await captured.session_list.execute({ scope: 'workspace' }, bareExec)).ok === false)
+check('list distinguishes fork from subagent',
+  list.text.includes('fork of session-a') && list.text.includes('subagent child of session-a'), list.text)
+check('list shows each model route', list.text.includes('session-a') && list.text.includes('| model p2/m9'), list.text)
+check('list shows unknown route when no projection', list.text.includes('| model (unknown)'), list.text)
+
+// session_models
+const models = await captured.session_models.execute({})
+check('models lists default', models.text.includes('deployment default: p1/m1'), models.text)
+check('models lists grouped ids and efforts', models.text.includes('p1/m1') && models.text.includes('efforts: low/high (default low)'), models.text)
+check('models reports discovery failures', models.text.includes('p3: no credential'), models.text)
+check('models survives an empty provider group', models.text.includes('p2 (Provider Two):') && models.text.includes('(no models listed)'), models.text)
+
+// session_model: read
+const readA = await captured.session_model.execute({ sessionId: 'session-a' }, callerExec)
+check('model read prefers the projection', readA.text.includes('next request will use: p2/m9 (effort low)') && readA.text.includes('last request ran on:   p1/m1'), readA.text)
+check('model read does not resume', !calls.some((c) => c[0] === 'selectModel'), JSON.stringify(calls))
+const readB = await captured.session_model.execute({ sessionId: 'session-b' }, callerExec)
+check('model read falls back to folding the log',
+  readB.text.includes('next request will use: p8/m8') && readB.text.includes('last request ran on:   p9/m9 (effort high)'), readB.text)
+
+// session_model: write
+const switched = await captured.session_model.execute({ sessionId: 'session-a', provider: 'p2', model: 'm9', reasoningEffort: 'high' }, callerExec)
+check('model switch ok', switched.ok === true && switched.text.includes('now uses p2/m9 (effort high)'), switched.text)
+check('model switch passes the full request',
+  calls.some((c) => c[0] === 'selectModel' && c[1] === 'session-a' && c[2] === 'p2' && c[3] === 'm9' && c[4] === 'high'), JSON.stringify(calls))
+check('model switch discloses the default-model side effect', switched.text.includes('deployment default'), switched.text)
+check('model switch without effort omits the field',
+  switched.ok === true && (await captured.session_model.execute({ sessionId: 'session-b', provider: 'p1', model: 'm1' }, callerExec)).ok === true
+  && calls.some((c) => c[0] === 'selectModel' && c[1] === 'session-b' && c[4] === 'undefined'))
+const halfPair = await captured.session_model.execute({ sessionId: 'session-a', provider: 'p2' }, callerExec)
+check('half a pair is rejected with guidance', halfPair.ok === false && halfPair.text.includes('both provider and model'), halfPair.text)
+
+// session_describe
+const set = await captured.session_describe.execute({ sessionId: 'session-a', description: 'owns the parser work' })
+check('describe write', set.ok === true && set.text.includes('owns the parser work'), set.text)
+check('note file on disk', (await persisted()).byId['session-a'].description === 'owns the parser work')
+check('describe read', (await captured.session_describe.execute({ sessionId: 'session-a' })).text.includes('owns the parser work'))
+check('note shows in session_list', (await captured.session_list.execute({ scope: 'workspace' }, callerExec)).text.includes('note: owns the parser work'))
+check('lineage persisted by the listing',
+  (await persisted()).byId['session-b'].parentId === 'session-a'
+  && (await persisted()).byId['session-b'].kind === 'fork'
+  && (await persisted()).byId['session-c'].kind === 'subagent'
+  && (await persisted()).byId['session-a'].kind === 'top-level',
+  JSON.stringify((await persisted()).byId))
+const beforeRepeat = await readFile(statePath, 'utf8')
+await captured.session_list.execute({ scope: 'workspace' }, callerExec)
+check('an unchanged store is not rewritten', (await readFile(statePath, 'utf8')) === beforeRepeat)
+check('describe clear', (await captured.session_describe.execute({ sessionId: 'session-a', description: '' })).text.includes('Cleared'))
+check('clearing a note keeps the persisted relations', (await persisted()).byId['session-a'].description === '' && (await persisted()).byId['session-a'].kind === 'top-level')
+check('unknown id warns', (await captured.session_describe.execute({ sessionId: 'session-nope', description: 'x' })).text.includes('Warning'))
+
+// session_read detail levels
+const textOnly = await captured.session_read.execute({ sessionId: 'session-a', detail: 'text' })
+check('text detail has prose', textOnly.text.includes('hello there') && textOnly.text.includes('hi back'), textOnly.text)
+check('text detail hides tools and reasoning', !textOnly.text.includes('bash(') && !textOnly.text.includes('file-a') && !textOnly.text.includes('secret thoughts'), textOnly.text)
+
+const withTools = await captured.session_read.execute({ sessionId: 'session-a', detail: 'tools' })
+check('tools detail has call', withTools.text.includes('bash({"command":"ls"})'), withTools.text)
+check('tools detail unwraps result', withTools.text.includes('file-a') && withTools.text.includes('file-b'), withTools.text)
+check('tools detail shows failure', withTools.text.includes('failed ToolError: EXPLODED') && withTools.text.includes('boom'), withTools.text)
+check('tools detail hides system and reasoning', !withTools.text.includes('injected context') && !withTools.text.includes('secret thoughts'), withTools.text)
+
+const all = await captured.session_read.execute({ sessionId: 'session-a', detail: 'all' })
+check('all detail has system, reasoning and title',
+  all.text.includes('injected context') && all.text.includes('secret thoughts') && all.text.includes('My title'), all.text)
+check('oldest first ordering kept', all.text.indexOf('hello there') < all.text.indexOf('My title'), all.text)
+
+// session_read size is the caller's to choose: maxChars is the per-event cap and
+// totalChars is the whole-response budget. Neither is fixed any more, but an
+// unqualified call still costs exactly what it used to (1200 per event, 12000 total).
+{
+  const BODY = 'A'.repeat(9000) + 'END-OF-BODY'
+  const ARGS = JSON.stringify({ command: 'printf "%s" ' + '"'.repeat(9000) })
+  logs['session-long'] = [
+    { type: 'user/message', seq: 1, time: 11000, data: { id: 'lm1', role: 'user', content: [{ type: 'text', text: BODY }], source: { kind: 'user' } } },
+    { type: 'assistant/message', seq: 2, time: 12000, data: { turn: 1, step: 1, message: { id: 'lm2', role: 'assistant', content: [{ type: 'text', text: 'short answer' }], source: { kind: 'model', provider: 'p', model: 'm' } } } },
+    { type: 'tool/call', seq: 3, time: 13000, data: { turn: 1, step: 1, callId: 'lc1', name: 'bash', arguments: ARGS } },
+  ]
+  const defaultRead = await captured.session_read.execute({ sessionId: 'session-long', detail: 'tools' })
+  check('read default still clips one long event at 1200',
+    /cap maxChars=1200, totalChars=12000/.test(defaultRead.text)
+      && /clipped to 1200 characters each/.test(defaultRead.text)
+      && !defaultRead.text.includes('END-OF-BODY'), defaultRead.text.slice(0, 300))
+  const wideRead = await captured.session_read.execute({ sessionId: 'session-long', detail: 'tools', maxChars: 20000 })
+  check('read honours a raised maxChars without eliding a long event',
+    wideRead.text.includes(BODY) && /cap maxChars=20000, totalChars=160000/.test(wideRead.text)
+      && !wideRead.text.includes('clipped'), wideRead.text.slice(0, 300))
+  const tightRead = await captured.session_read.execute({ sessionId: 'session-long', detail: 'tools', maxChars: 2000, totalChars: 1500 })
+  check('read stops at the totalChars budget and says so',
+    /totalChars=1500/.test(tightRead.text)
+      && /stopped at the 1500-character budget \(2001 of 1500 returned\)/.test(tightRead.text)
+      && !tightRead.text.includes('END-OF-BODY'), tightRead.text.slice(0, 300))
+  check('read reports the cap that cut the text, not a bare ellipsis',
+    /stopped at the 1500-character budget/.test(tightRead.text)
+      && !/clipped to/.test(tightRead.text) && !/reached the end/.test(tightRead.text), tightRead.text.split('\n')[0])
+  check('read widens the tool-call argument cap with maxChars',
+    wideRead.text.includes(ARGS) && !defaultRead.text.includes(ARGS), defaultRead.text.slice(0, 300))
+  const floorRead = await captured.session_read.execute({ sessionId: 'session-long', maxChars: 1 })
+  check('read floors maxChars at 1 and accepts it',
+    /cap maxChars=1, totalChars=8/.test(floorRead.text)
+      && /clipped to 1 character each/.test(floorRead.text), floorRead.text.slice(0, 300))
+  const hugeMaxChars = await captured.session_read.execute({ sessionId: 'session-long', maxChars: 10 ** 12 })
+  check('read clamps an absurd maxChars to the 500000 ceiling',
+    /cap maxChars=500000/.test(hugeMaxChars.text) && hugeMaxChars.text.includes('END-OF-BODY'),
+    hugeMaxChars.text.slice(0, 300))
+  const hugeTotalChars = await captured.session_read.execute({ sessionId: 'session-long', totalChars: 10 ** 12 })
+  check('read clamps an absurd totalChars to the 5000000 ceiling',
+    /totalChars=5000000/.test(hugeTotalChars.text), hugeTotalChars.text.split('\n')[0])
+
+}
+
+// send / stop / fork
+check('send ok', (await captured.session_send.execute({ sessionId: 'session-b', text: 'status?', mode: 'steer' }, callerExec)).ok === true
+  && calls.some((c) => c[0] === 'prompt' && c[2] === 'steer' && c[3] === 'status?'))
+check('self send blocked', (await captured.session_send.execute({ sessionId: 'whatever', text: 'x' }, { agent: { id: 'whatever' } })).ok === false)
+check('empty send rejected', (await captured.session_send.execute({ sessionId: 'session-b', text: '   ' }, callerExec)).ok === false)
+check('stop ok', (await captured.session_stop.execute({ sessionId: 'session-c' }, callerExec)).ok === true
+  && calls.some((c) => c[0] === 'cancel' && c[1] === 'session-c'))
+check('fork returns child', (await captured.session_fork.execute({ sessionId: 'session-a' }, callerExec)).text.includes('session-forked'))
+check('fork auto-titles "<title> · fork"', calls.some((c) => c[0] === 'rename' && c[1] === 'session-forked' && c[2] === 'Alpha · fork'))
+await captured.session_fork.execute({ sessionId: 'session-a', atSeq: 42, title: 'branch B' }, callerExec)
+check('fork passes atSeq and title', calls.some((c) => c[0] === 'fork' && c[2] === '42') && calls.some((c) => c[1] === 'session-forked' && c[2] === 'branch B'))
+
+// session_rename: read and set the title the whole GUI sees
+const renamesBefore = calls.filter((c) => c[0] === 'rename').length
+const readTitle = await captured.session_rename.execute({ sessionId: 'session-a' }, callerExec)
+check('rename read returns the projected title', readTitle.ok === true && readTitle.text.includes('title: Alpha'), readTitle.text)
+check('rename read writes nothing', calls.filter((c) => c[0] === 'rename').length === renamesBefore)
+check('rename read explains an untitled session',
+  (await captured.session_rename.execute({ sessionId: 'session-c' }, callerExec)).text.includes('no durable title'))
+const renamed = await captured.session_rename.execute({ sessionId: 'session-a', title: '  parser   rewrite  ' }, callerExec)
+check('rename passes the RAW title to the host, not a pre-trimmed copy',
+  calls.some((c) => c[0] === 'rename' && c[1] === 'session-a' && c[2] === '  parser   rewrite  '),
+  JSON.stringify(calls.filter((c) => c[0] === 'rename').slice(-1)))
+check('rename reports the ACCEPTED title and the pinning side effect',
+  renamed.ok === true && renamed.text.includes('Renamed session-a to: parser rewrite') && renamed.text.includes('pinned'), renamed.text)
+// The host is the authority on what it accepted: it normalizes and truncates, so
+// the report must echo ITS answer rather than the string that was sent.
+const truncated = await captured.session_rename.execute({ sessionId: 'session-a', title: 'a title far longer than the host accepts' }, callerExec)
+check('rename reports what the host accepted, not what was sent',
+  truncated.text.includes('to: a title far longer th') && !truncated.text.includes('host accepts'), truncated.text)
+check('rename records the accepted title in the durable store',
+  (await persisted()).byId['session-a'].title === 'a title far longer than',
+  JSON.stringify((await persisted()).byId['session-a']))
+check('rename leaves the session lineage alone',
+  (await persisted()).byId['session-a'].parentId === null && (await persisted()).byId['session-a'].kind === 'top-level',
+  JSON.stringify((await persisted()).byId['session-a']))
+check('an all-invisible title is refused before it reaches the host',
+  (await captured.session_rename.execute({ sessionId: 'session-a', title: '‎  ' }, callerExec)).ok === false)
+check('an ANSI-only title is refused before it reaches the host',
+  (await captured.session_rename.execute({ sessionId: 'session-a', title: '[31m[0m' }, callerExec)).ok === false)
+check('an empty title is refused as an un-settable title, not silently ignored',
+  (await captured.session_rename.execute({ sessionId: 'session-a', title: '' }, callerExec)).ok === false)
+check('only the three settable renames reached the host',
+  calls.filter((c) => c[0] === 'rename').length === 4,
+  JSON.stringify(calls.filter((c) => c[0] === 'rename')))
+const hostRejected = await captured.session_rename.execute({ sessionId: 'session-a', title: 'boom' }, callerExec)
+check('a host refusal is surfaced with its code explained',
+  hostRejected.ok === false && hostRejected.text.includes('Renaming session-a failed'), hostRejected.text)
+check('rename requires a sessionId', (await captured.session_rename.execute({}, callerExec)).ok === false)
+
+// session_queue
+const mutationsBefore = calls.filter((c) => c[0] === 'prompt' || c[0] === 'cancel').length
+const queue = await captured.session_queue.execute({ sessionId: 'session-a' }, callerExec)
+check('queue lists pending messages in delivery order', queue.ok === true
+  && queue.text.indexOf('run the tests after this turn') < queue.text.indexOf('stop and report'), queue.text)
+check('queue shows placement per message',
+  queue.text.includes('[queued]') && queue.text.includes('[steering]'), queue.text)
+check('queue reports the count and the session', queue.text.includes('3 pending messages in session-a'), queue.text)
+check('queue clips long text by default', queue.text.includes('…') && !queue.text.includes('x'.repeat(500)), queue.text.slice(0, 200))
+check('queue honours maxChars', (await captured.session_queue.execute({ sessionId: 'session-a', maxChars: 100 }, callerExec)).text.split('\n')[3].length < 160)
+check('queue handles an attached session with nothing pending',
+  (await captured.session_queue.execute({ sessionId: 'session-live-empty' }, callerExec)).text.includes('nothing pending'))
+check('queue explains a session with no live inbox',
+  (await captured.session_queue.execute({ sessionId: 'session-b' }, callerExec)).text.includes('No live inbox is registered'))
+check('queue requires a sessionId', (await captured.session_queue.execute({}, callerExec)).ok === false)
+check('queue releases the live stream it borrowed',
+  controlSignals.length >= 1 && controlSignals.every((signal) => signal.aborted === true), JSON.stringify(controlSignals.map((s) => s.aborted)))
+check('queue is read-only', calls.filter((c) => c[0] === 'prompt' || c[0] === 'cancel').length === mutationsBefore, JSON.stringify(calls))
+
+// session_compact
+const compacted = await captured.session_compact.execute({ sessionId: 'session-b' }, callerExec)
+check('compact runs /compact for the target',
+  compacted.ok === true && calls.some((c) => c[0] === 'command' && c[1] === 'session-b' && c[2] === '/compact'), compacted.text)
+check('compact reports what it folded', compacted.text.includes('Compacted 12 history items'), compacted.text)
+check('compact passes a real cancellation signal and no attachments',
+  calls.some((c) => c[0] === 'command' && c[3] === 'true' && c[4] === '0'), JSON.stringify(calls.filter((c) => c[0] === 'command')))
+check('compact surfaces a refused compaction',
+  (await captured.session_compact.execute({ sessionId: 'session-busy' }, callerExec)).text.includes('not idle'))
+check('compact explains a preset without compaction',
+  (await captured.session_compact.execute({ sessionId: 'session-minimal' }, callerExec)).text.includes('does not compose compaction'))
+check('compact explains a cold session',
+  (await captured.session_compact.execute({ sessionId: 'session-cold' }, callerExec)).text.includes('no attached agent'))
+check('compact refuses the caller itself',
+  (await captured.session_compact.execute({ sessionId: 'me' }, callerExec)).ok === false)
+check('compact requires a sessionId', (await captured.session_compact.execute({}, callerExec)).ok === false)
+
+// session_send callback: the ledger, the watcher, and the notice back
+const ledger = async () => JSON.parse(await readFile(statePath, 'utf8')).delegations
+const sentWithCallback = await captured.session_send.execute({ sessionId: 'session-b', text: 'summarise the parser work', callback: true }, callerExec)
+check('send with callback announces the delegation',
+  sentWithCallback.ok === true && sentWithCallback.text.includes('callback dlg-'), sentWithCallback.text)
+const afterSend = await ledger()
+check('callback records a pending delegation',
+  afterSend.length === 1 && afterSend[0].status === 'pending' && afterSend[0].to === 'session-b' && afterSend[0].from === 'me' && afterSend[0].mode === 'queue',
+  JSON.stringify(afterSend))
+check('the delegation keeps the delivered text as its task', afterSend[0].task === 'summarise the parser work')
+check('send without callback records nothing',
+  (await captured.session_send.execute({ sessionId: 'session-c', text: 'no callback here' }, callerExec)).ok === true && (await ledger()).length === 1)
+check('callback without a caller identity is refused',
+  (await captured.session_send.execute({ sessionId: 'session-c', text: 'x', callback: true }, bareExec)).ok === false)
+check('a watcher tick is registered', ticks.length === 1)
+
+// Now the target works: our prompt is admitted, it answers, the turn ends.
+logs['session-b'] = [
+  { type: 'turn/end', seq: 10, time: 10, data: { turn: 9, reason: { kind: 'completed' } } },
+  { type: 'user/message', seq: 11, time: 11, data: { id: 'm10', role: 'user', content: [{ type: 'text', text: 'summarise the parser work' }], source: { kind: 'user' } } },
+  { type: 'assistant/message', seq: 12, time: 12, data: { turn: 10, step: 1, message: { content: [{ type: 'text', text: 'parser work is done; two files changed' }] } } },
+  { type: 'turn/end', seq: 13, time: 13, data: { turn: 10, reason: { kind: 'completed' } } },
+]
+ticks[0]()
+const ledgerText = (await captured.session_delegations.execute({}, callerExec)).text
+check('the ledger tool checks first and reports the settled row',
+  ledgerText.includes('done') && ledgerText.includes('parser work is done'), ledgerText)
+const settledRows = await ledger()
+check('the delegation settles done with the reply it produced',
+  settledRows[0].status === 'done' && settledRows[0].reply === 'parser work is done; two files changed', JSON.stringify(settledRows[0]))
+check('the outcome is delivered into the delegator session as a queued message',
+  calls.some((c) => c[0] === 'prompt' && c[1] === 'me' && c[2] === 'queue' && c[3].includes('[callback]') && c[3].includes('session_read') && !c[3].includes('parser work is done')),
+  JSON.stringify(calls.filter((c) => c[0] === 'prompt' && c[1] === 'me').map((c) => c[3])))
+const mePrompts = () => calls.filter((c) => c[0] === 'prompt' && c[1] === 'me').length
+const deliveredOnce = mePrompts()
+ticks[0]()
+await captured.session_delegations.execute({}, callerExec)
+check('a settled delegation is never delivered twice', mePrompts() === deliveredOnce, String(mePrompts()))
+
+// A turn that ends badly settles as failed, with the reason and whatever prose came out.
+await captured.session_send.execute({ sessionId: 'session-big', text: 'big job', callback: true }, callerExec)
+logs['session-big'] = [
+  { type: 'user/message', seq: 10, time: 10, data: { id: 'm20', role: 'user', content: [{ type: 'text', text: 'big job' }], source: { kind: 'user' } } },
+  { type: 'assistant/message', seq: 11, time: 11, data: { turn: 1, step: 1, message: { content: [{ type: 'text', text: 'starting' }] } } },
+  { type: 'turn/end', seq: 12, time: 12, data: { turn: 1, reason: { kind: 'aborted', reason: { kind: 'user' } } } },
+]
+await captured.session_delegations.execute({}, callerExec)
+const failedRow = (await ledger()).find((row) => row.to === 'session-big')
+check('a bad ending settles as failed with its reason',
+  failedRow.status === 'failed' && failedRow.note.includes('aborted') && failedRow.reply === 'starting', JSON.stringify(failedRow))
+
+// A turn/end BEFORE our prompt is admitted says nothing about the task.
+await captured.session_send.execute({ sessionId: 'session-quiet', text: 'still waiting', callback: true }, callerExec)
+logs['session-quiet'] = [{ type: 'turn/end', seq: 10, time: 10, data: { turn: 2, reason: { kind: 'completed' } } }]
+await captured.session_delegations.execute({}, callerExec)
+const quietRow = (await ledger()).find((row) => row.to === 'session-quiet')
+check('a turn that ends before the prompt is admitted leaves it pending', quietRow.status === 'pending')
+check('the status filter selects it', (await captured.session_delegations.execute({ status: 'pending' }, callerExec)).text.includes(quietRow.id))
+check('session_queue marks the target of a delegation',
+  (await captured.session_queue.execute({ sessionId: 'session-b' }, callerExec)).text.includes('Delegations to session-b: 1 recorded'))
+const toDismiss = (await ledger())[0]
+check('dismiss forgets a row',
+  (await captured.session_delegations.execute({ dismiss: toDismiss.id }, callerExec)).text.includes(`Forgot delegation ${toDismiss.id}`))
+check('the dismissed row is gone',
+  (await ledger()).length === 2 && (await ledger()).every((row) => row.id !== toDismiss.id))
+
+// session_create: a brand-new top-level session, not a fork
+const createCalls = () => calls.filter((row) => row[0] === 'create').map((row) => JSON.parse(row[1]))
+const createdOne = await captured.session_create.execute({}, callerExec)
+check('create returns the new session id',
+  createdOne.ok === true && createdOne.text.includes('session-new-1'), createdOne.text)
+check('create attaches when the cwd is a registered workspace root',
+  same(createCalls()[0], { agentPreset: 'standard', workspaceId: 'ws-1' }), JSON.stringify(createCalls()[0]))
+check('create reports the preset, the workspace and the id',
+  createdOne.text.includes('preset standard') && createdOne.text.includes('attached to workspace ws-1') && createdOne.text.includes('empty history'), createdOne.text)
+const createdTwo = await captured.session_create.execute({ preset: 'ptc', cwd: '/tmp/elsewhere', title: 'worker', provider: 'p2', model: 'm9', reasoningEffort: 'high' }, callerExec)
+check('create honours an explicit preset', createCalls()[1].agentPreset === 'ptc')
+check('an unregistered cwd is passed as cwd, never together with a workspace',
+  createCalls()[1].cwd === '/tmp/elsewhere' && createCalls()[1].workspaceId === undefined, JSON.stringify(createCalls()[1]))
+check('create titles the new session',
+  calls.some((row) => row[0] === 'rename' && row[1] === 'session-new-2' && row[2] === 'worker'))
+check('create starts it on the requested route',
+  calls.some((row) => row[0] === 'selectModel' && row[1] === 'session-new-2' && row[2] === 'p2' && row[3] === 'm9' && row[4] === 'high'))
+check('create reports the route and the non-attachment',
+  createdTwo.text.includes('model p2/m9') && createdTwo.text.includes('not attached to any workspace'), createdTwo.text)
+await captured.session_create.execute({}, { agent: { id: 'me', session: { header: { cwd: '/tmp/repo', agentPreset: 'ptc' } } } })
+check('create inherits the caller preset when one is recorded', createCalls()[2].agentPreset === 'ptc')
+check('create refuses half a model pair',
+  (await captured.session_create.execute({ provider: 'p2' }, callerExec)).ok === false)
+const badPreset = await captured.session_create.execute({ preset: 'nope' }, callerExec)
+check('an unknown preset fails with guidance',
+  badPreset.ok === false && badPreset.text.includes('check the preset id'), badPreset.text)
+const boomTitle = await captured.session_create.execute({ title: 'boom' }, callerExec)
+check('a failed title does not lose the created session',
+  boomTitle.ok === true && boomTitle.text.includes('title NOT set') && boomTitle.text.includes('session-new-'), boomTitle.text)
+const afterCreate = JSON.parse(await readFile(statePath, 'utf8'))
+check('the created session is recorded in the durable ledger',
+  afterCreate.byId['session-new-1'] !== undefined && afterCreate.byId['session-new-1'].kind === 'top-level' && afterCreate.byId['session-new-1'].cwd === '/tmp/repo',
+  JSON.stringify(afterCreate.byId['session-new-1']))
+
+const failures = results.filter((row) => row[0] === 'FAIL')
+for (const [status, label, detail] of results) console.log(`${status}  ${label}${detail}`)
+console.log(`\n${results.length - failures.length}/${results.length} passed`)
+await rm(dshHome, { recursive: true, force: true })
+if (failures.length > 0) process.exit(1)
