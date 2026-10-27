@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "会话管理工具",
+    "description": "在单个 agent preset 内协调其它会话：创建、列出、读取、fork、指派、排队、切换模型、压缩，并控制 GUI 归档与置顶。"
+  }
+}

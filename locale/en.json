@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Session Management",
+    "description": "Coordinate other sessions inside one agent preset: create/list/read/fork/assign/queue/model/compact, plus GUI archive and pin."
+  }
+}

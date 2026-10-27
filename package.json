@@ -10,7 +10,8 @@
     "./loop": "./lib/loop.mjs",
     "./store": "./lib/store.mjs",
     "./ask-bridge": "./lib/ask-bridge.mjs",
-    "./package.json": "./package.json"
+    "./package.json": "./package.json",
+    "./locale/*.json": "./locale/*.json"
   },
   "dsh": {
     "bundle": {
