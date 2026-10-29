@@ -1,4 +1,4 @@
-# @local/session-management
+# dsh-session-management
 
 Session management for a single agent preset: it coordinates other sessions (create / list / read / fork / assign / queue / model / compact) and controls their GUI placement (archive / unarchive / pin / unpin).
 
@@ -16,7 +16,7 @@ Every tool is registered inside the preset's own scope, so no other preset can s
 
 ## Wiring
 
-Bundle patch: `cordis.patch.yml`. Declare a preset that imports `@local/session-management/tools` to give one agent the coordinator role.
+Bundle patch: `cordis.patch.yml`. Declare a preset that imports `dsh-session-management/tools` to give one agent the coordinator role.
 
 > The coordinator preset is currently loaded from a local source directory via a symlink in the profile's `node_modules`, not from npm. Publishing this repository does not change which file the running profile reads.
 

@@ -43,11 +43,11 @@
                 如实转述子会话的产出，不添自己的分析和润色；委派失败、被拒绝或仍 pending，明说，不假装完成。
               suffix: 你自己的会话工作目录是 {{cwd}}，子会话默认继承它——委派时说明工作目录即可，不必反复声明。
           - id: tool-session-control
-            name: '@local/session-management/tools'
+            name: 'dsh-session-management/tools'
           - id: tool-workspace
-            name: '@local/session-management/workspace'
+            name: 'dsh-session-management/workspace'
           - id: tool-loop
-            name: '@local/session-management/loop'
+            name: 'dsh-session-management/loop'
             disabled: true
           - id: tool-fs
             name: '@deepseek-ai/dsh-tool-fs'
