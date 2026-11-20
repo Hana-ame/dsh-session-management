@@ -4,6 +4,7 @@
   "private": true,
   "type": "module",
   "description": "Session management for one agent preset: coordinate other sessions (create/list/read/fork/assign/queue/model/compact) and control their GUI placement (archive/unarchive/pin/unpin). Every tool is registered inside the preset's own scope, so no other preset sees them.",
+  "author": "nanaka",
   "exports": {
     "./tools": "./lib/tools.mjs",
     "./workspace": "./lib/workspace.mjs",
