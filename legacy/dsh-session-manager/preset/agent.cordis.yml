@@ -1,0 +1,161 @@
+# The `session-manager` agent preset: a coordination-focused agent.
+#
+# This file is an AGENT-PLANE composition. The roster mounts it ONCE under a
+# standing scope; every session naming it joins by scope parentage, so the
+# tools and prompt sections registered here cover each joined agent while a
+# session's own state stays keyed per Session/Agent inside the plugins. The host
+# composition keeps everything a preset must not own: the registries
+# themselves, the sandbox and approval stack, persistence, and the model route.
+#
+# What this preset deliberately does NOT compose, compared with `standard`:
+# no shell (`tool-bash` / `tool-pwsh`), no background-job controls, no skills,
+# no plan mode, no presentation tool, and no delegation/workflow rows. The
+# agent this produces cannot run commands; besides observing and directing
+# OTHER sessions through the tools registered by the `@local/dsh-session-manager`
+# package (see the `tool-session-control` row), it holds its own filesystem
+# read/write tools (the filesystem rows below), so the persona's "read
+# ~/knowledge-base/INDEX.md first" is something the agent can do itself rather
+# than delegating.
+#
+# Web access is not a row here: `tool-web` is re-enabled on the HOST plane by
+# the home patch ($DSH_HOME/cordis.patch.yml), so every session has it no
+# matter which preset it names.
+#
+# The tools row names the PACKAGE, not a file in this directory, so the package
+# stays the single source of truth for both of its layers: the durable records
+# (lib/store.mjs) and the tools (lib/tools.mjs). The specifier is relative because
+# `@deepseek-ai/dsh-agent-presets` resolves a "."-prefixed specifier against this
+# composition's own directory and a bare package name against the HARNESS
+# install — `../../profiles/node_modules/...` is the one form that reaches the
+# installed package. Installing this preset therefore means installing the
+# package too: see ../install.sh.
+#
+# A service row here MUST sit inside a group carrying an `isolate` realm.
+# The one such group below is `compaction`. The session-control row publishes
+# no service — it consumes the HOST `tools`, `sessionController`, and `agents`
+# registries — so it must stay OUTSIDE any realm: behind one it would resolve a
+# private registry this preset never populates, and its tools would silently
+# contribute nothing.
+
+# ── identity ────────────────────────────────────────────────────────────────
+
+# The persona below is the FULL coordinator prompt, mirrored byte-for-byte with
+# the live declaration in /mnt/e/session-management/cordis.patch.yml (bundle
+# @local/session-management). NOTE: since dsh 0.1.7-rc.2 this legacy directory
+# is NOT read any more; the copy exists only so repo and old deployment stay in
+# sync (install.sh copies preset/ -> .agent-presets/). `{{cwd}}` resolves from
+# the agent's own workspace.
+- id: persona
+  name: '@deepseek-ai/dsh-persona'
+  config:
+    prefix: |-
+      你是会话管理协调者，请先读~/knowledge-base/INDEX.md（读取纪律与维护提示见 ~/knowledge-base/README.md）
+      
+      ## 核心职责：委派优先，不要自己干活
+      你是协调者，不是执行者。用户交给你的事，默认派给子会话（subsession）去做，你不亲自执行；真正动手的永远是子会话，你负责拆任务、派任务、收结果、汇总汇报。
+      
+      只有两类事你自己做：
+      - 用户直接向你的提问、确认、寒暄；
+      - 轻量的会话簿记与协调元操作（session_list、session_read 一瞥状态、session_delegations 查账、重命名、归档、切模型、压缩、排队管理）。
+      
+      你没有 shell：跑命令、跑测试与构建、批量编辑、多文件重构、长时间分析这类执行类工作，一律委派子会话完成，别把子会话当跑腿，也别自己下场替它做。
+      但文件读写与联网是你自带的辅助能力：read / write / edit 与 web_search / web_fetch 可直接做——读已知路径、新建或修改笔记/清单/账本/汇报产物等单个文本文件、查资料取数，都不需要委派；只有批量改动、需要执行进程的活（写代码开发、跑测试构建）才必须派出去。
+      
+      ## 委派流程
+      1. 先 session_list 看有没有可复用的子会话；没有才 session_create。
+         关键：session_create 默认继承你自己的 preset，那会造出又一个协调者而不是执行者，所以必须显式传 preset:"standard"（按任务需要选 ptc 等）。
+      2. 用 session_send 投递任务，把背景、工作目录、验收标准与期望产出一次写全；并行任务各自一个子会话，同一主题的后续追问投给原会话（继续 session_send），不要重复创建。
+      3. 需要回收结果的委派一律加 callback:true——回执会作为排队消息把你唤醒，所以派完活就静默等它，别自己轮询干等。回执只有状态与回复长度、不含正文，读回原文用 session_read 指向子会话。
+      4. 派出去的活都要在账本里可追踪（session_delegations）。failed/unknown 就重新委派或亲自 session_read 确认；子会话提问了就回答它；一直 pending 就 session_list 看它是否还在跑。
+      5. 手里有活的委派时用 schedule_create 建定时巡检：`every_seconds: 120`，prompt 写「检查 delegation 账本、各会话状态与知识库健康，有新结算委托、疑似卡住会话或知识库异常才向用户汇报，一切正常就简短回复『无事』，别打扰用户」；委派收完后用 schedule_delete 清掉，别留空转任务。
+      
+      ## 汇报
+      如实转述子会话的产出，不添自己的分析和润色；委派失败、被拒绝或仍 pending，明说，不假装完成。
+    suffix: 你自己的会话工作目录是 {{cwd}}，子会话默认继承它——委派时说明工作目录即可，不必反复声明。
+
+# ── session management ──────────────────────────────────────────────────────
+
+# A relative specifier resolves against THIS composition's own directory, so the
+# plugin travels with the preset and needs no package install. It imports no
+# packages — only `node:*` builtins, which resolve anywhere — and registers six
+# tools; see the file's own header for why.
+- id: tool-session-control
+  name: '../../profiles/node_modules/@local/dsh-session-manager/lib/tools.mjs'
+
+# `/loop` — human slash command plus a fixed-rate (default 120 s) per-session
+# inspection timer, implemented by the sibling package module `lib/loop.mjs`.
+# It registers the command into the HOST `commands` registry and consumes the
+# host `sessionController` / `agents` / `timer` services through `ctx.get`,
+# and publishes no service of its own — so, exactly like `tool-session-control`,
+# this row must stay OUTSIDE any `isolate` realm (behind one it would resolve a
+# private registry this preset never populates, and `/loop` would do nothing).
+- id: tool-loop
+  name: '../../profiles/node_modules/@local/dsh-session-manager/lib/loop.mjs'
+
+# ── filesystem ──────────────────────────────────────────────────────────────
+
+# Both rows register into the host `tools` registry and provide nothing, so they
+# need no realm; the `fs` service and its policy stay in the host composition.
+# `tool-fs` supplies read / write / edit / read_image, `tool-fs-search` supplies
+# glob / grep — together, opening, searching, listing and editing files.
+- id: tool-fs
+  name: '@deepseek-ai/dsh-tool-fs'
+
+- id: tool-fs-search
+  name: '@deepseek-ai/dsh-tool-fs-search'
+  config:
+    sampleOverCapGlobResults: false
+
+# ── coordination supporting rows ────────────────────────────────────────────
+
+- id: tool-ask-user
+  name: '@deepseek-ai/dsh-tool-ask-user'
+
+# The TODO list is how one coordinator tracks several sessions at once. Both
+# rows below and above register into the host `tools` registry and provide
+# nothing, so they need no realm.
+- id: tool-todo
+  name: '@deepseek-ai/dsh-tool-todo'
+  config:
+    allowParallelInProgress: true
+
+# The goal service and its session driver stay on the host plane, where the
+# Gateway can resolve them. The human command and the model-facing tool
+# register into THIS preset's scoped layers.
+- id: command-goal
+  name: '@deepseek-ai/dsh-command-goal'
+
+- id: tool-goal
+  name: '@deepseek-ai/dsh-tool-goal'
+
+# ── compaction ──────────────────────────────────────────────────────────────
+
+# `compaction-basic` reads `toolResultPrune` through `ctx.get`, so the pruner
+# must share this realm rather than sit outside it.
+#
+# `tokenMeter` is deliberately NOT in this realm: the meter stays on the HOST
+# plane, and the rows here resolve that one instance. It takes no
+# configuration, keys every fold by Session, and owns the context-meter
+# projection units the browser reads for every session — behind a realm those
+# units would come and go with whichever presets happen to be mounted. What a
+# preset chooses is whether its agent compacts at all, which is
+# `compaction-basic` below.
+- id: compaction
+  name: cordis:group
+  group: true
+  isolate:
+    compaction: true
+    toolResultPruner: true
+  config:
+    - id: compaction-basic
+      name: '@deepseek-ai/dsh-compaction-basic'
+
+    - id: command-compact
+      name: '@deepseek-ai/dsh-command-compact'
+
+    - id: tool-result-pruner
+      name: '@deepseek-ai/dsh-compaction-tool-result-pruner'
+      config:
+        thresholdChars: 8192
+        headChars: 4096
+        tailChars: 1024
