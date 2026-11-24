@@ -5,6 +5,12 @@
   "type": "module",
   "description": "Session management for one agent preset: coordinate other sessions (create/list/read/fork/assign/queue/model/compact) and control their GUI placement (archive/unarchive/pin/unpin). Every tool is registered inside the preset's own scope, so no other preset sees them.",
   "author": "nanaka",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Hana-ame/dsh-session-management.git"
+  },
+  "homepage": "https://github.com/Hana-ame/dsh-session-management#readme",
   "exports": {
     "./tools": "./lib/tools.mjs",
     "./workspace": "./lib/workspace.mjs",
